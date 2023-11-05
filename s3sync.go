@@ -24,6 +24,8 @@ import (
 
 func main() {
 
+	initPtr := flag.Bool("init", false, "initialize a directory for syncing")
+
 	flag.Parse()
 
 	s := syncer{}
@@ -43,7 +45,14 @@ func main() {
 
 	_, err = os.Stat(s.metaDir)
 	if errors.Is(err, fs.ErrNotExist) {
-		log.Fatal(err)
+		if *initPtr {
+			s.init()
+			return
+		} else {
+			log.Fatal("The specified directory is not configured for syncing, i.e, it does not have a .s3sync directory in it")
+		}
+	} else if *initPtr {
+		log.Fatal("A .s3sync directory already exists in the specified directory")
 	}
 
 	logFile, err := os.Create(filepath.Join(s.metaDir, "log.txt"))
@@ -121,6 +130,35 @@ func main() {
 		s.createIndexFile(s.index.RemoteVersion)
 		log.Infof("The sync is incomplete with %v conflicts and %v errors. Run the sync again after resolving conflicts and deleting the .conflict files.", s.conflictCount, s.errorCount)
 	}
+}
+
+func (s *syncer) init() {
+	err := os.MkdirAll(s.metaDir, s.dirMode)
+	if err != nil {
+		log.Fatalf("Failed to create directory %v: %v", s.metaDir, err)
+	}
+	configPath := filepath.Join(s.metaDir, "config.xtn")
+	configFile, err := os.Create(configPath)
+	if err != nil {
+		log.Fatalf("Failed to create file %v: %v", configPath, err)
+	}
+	defer configFile.Close()
+	_, err = fmt.Fprintf(configFile, `# The name of the aws profile to be used for region selection and credentials. Refer to the AWS documentation on configuring a profile.
+aws_profile: 
+
+# The name of the Amazon S3 bucket to be used for syncing.
+bucket_name: 
+
+# A key prefix that can be used to restrict syncing to only a subset of files in the bucket.
+key_prefix: 
+
+# Any unique name to distinguish this particular folder from any other folders that will also be synced against the same bucket.
+source_name: 
+	`)
+	if err != nil {
+		log.Fatalf("Failed to write to the file %v: %v", configPath, err)
+	}
+	fmt.Printf("Fill in the config file created at %v", configPath)
 }
 
 type syncer struct {
