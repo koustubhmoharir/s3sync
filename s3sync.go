@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"mime"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/koustubhmoharir/pathern/patherngo/pathern"
 	"github.com/koustubhmoharir/xtn/xtngo/xtn"
 	log "github.com/sirupsen/logrus"
 )
@@ -37,22 +39,60 @@ func main() {
 
 	dirInfo, err := os.Stat(dirPath)
 	if errors.Is(err, fs.ErrNotExist) {
-		log.Fatal(err)
+		fmt.Println("The specified directory does not exist. Error details:")
+		fmt.Println(err)
+		os.Exit(1)
 	}
 	s.dir = dirPath
-	s.metaDir = filepath.Join(dirPath, ".s3sync")
 	s.dirMode = dirInfo.Mode()
+	s.rootDir = s.dir
+	for {
+		syncPath := filepath.Join(s.rootDir, "s3sync.xtn")
+		_, err := os.Stat(syncPath)
+		if errors.Is(err, fs.ErrNotExist) {
+			parentDir := filepath.Dir(s.rootDir)
+			if parentDir == s.rootDir {
+				if *initPtr {
+					s.rootDir = s.dir
+					s.init()
+					return
+				}
+				fmt.Println("s3sync.xtn was not found in the specified directory or any of its parents.")
+				os.Exit(1)
+			}
+			s.rootDir = parentDir
+			continue
+		}
+		break
+	}
 
-	_, err = os.Stat(s.metaDir)
-	if errors.Is(err, fs.ErrNotExist) {
-		if *initPtr {
+	if *initPtr {
+		if s.rootDir == s.dir {
 			s.init()
 			return
-		} else {
-			log.Fatal("The specified directory is not configured for syncing, i.e, it does not have a .s3sync directory in it")
 		}
-	} else if *initPtr {
-		log.Fatal("A .s3sync directory already exists in the specified directory")
+		fmt.Printf("s3sync.xtn was found in %v\nCannot init in a sub-directory of a directory that is already configured to sync. Modify this s3sync.xtn file instead to add sub-directories and patterns", s.rootDir)
+		os.Exit(1)
+	}
+
+	configPath := filepath.Join(s.rootDir, ".s3sync", "config.xtn")
+	_, err = os.Stat(configPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		fmt.Printf("%v does not exist. Error details:", configPath)
+		fmt.Println(err)
+		os.Exit(1)
+	}
+
+	s.relDir, err = filepath.Rel(s.rootDir, s.dir)
+	if err != nil {
+		log.Fatalf("failed to get relative path from root directory, %v", err)
+	}
+
+	s.metaDir = filepath.Join(s.rootDir, ".s3sync", s.relDir)
+	err = os.MkdirAll(s.metaDir, s.dirMode)
+	if err != nil {
+		fmt.Printf("Failed to create directory %v: %v\n", s.metaDir, err)
+		os.Exit(1)
 	}
 
 	logFile, err := os.Create(filepath.Join(s.metaDir, "log.txt"))
@@ -133,18 +173,23 @@ func main() {
 }
 
 func (s *syncer) init() {
-	err := os.MkdirAll(s.metaDir, s.dirMode)
+	metaDir := filepath.Join(s.rootDir, ".s3sync")
+	err := os.MkdirAll(metaDir, s.dirMode)
 	if err != nil {
-		log.Fatalf("Failed to create directory %v: %v", s.metaDir, err)
+		fmt.Printf("Failed to create directory %v: %v\n", metaDir, err)
+		os.Exit(1)
 	}
-	configPath := filepath.Join(s.metaDir, "config.xtn")
-	configFile, err := os.Create(configPath)
-	if err != nil {
-		log.Fatalf("Failed to create file %v: %v", configPath, err)
-	}
-	defer configFile.Close()
-	_, err = fmt.Fprintf(configFile, `# The name of the aws profile to be used for region selection and credentials. Refer to the AWS documentation on configuring a profile.
-aws_profile: 
+
+	syncPath := filepath.Join(s.rootDir, "s3sync.xtn")
+	_, err = os.Stat(syncPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		syncFile, err := os.Create(syncPath)
+		if err != nil {
+			fmt.Printf("Failed to create file %v: %v\n", syncPath, err)
+			os.Exit(1)
+		}
+		defer syncFile.Close()
+		_, err = fmt.Fprintf(syncFile, `
 
 # The name of the Amazon S3 bucket to be used for syncing.
 bucket_name: 
@@ -152,22 +197,60 @@ bucket_name:
 # A key prefix that can be used to restrict syncing to only a subset of files in the bucket.
 key_prefix: 
 
+
+.{}:
+	# Add patterns for files that should be synced with the bucket
+	<patterns>[]:
+		+: **/*
+	----
+	# Add objects with the same syntax as this object for any child directories that should be synced independently of this directory. The key of the object should be the directory name.
+	# The structure can be nested arbitrarily deeply. <patterns> should be omitted for directories that should not sync independently.
+	# The patterns at a higher level in the hierarchy should not include any files from directories that will be synced independently. Hence if any objects are added below, the <patterns> above should be modified to exclude files that are targeted at a sub-directory level.
+----
+	`)
+		if err != nil {
+			fmt.Printf("Failed to write to the file %v: %v\n", syncPath, err)
+			os.Exit(1)
+		}
+	}
+
+	configPath := filepath.Join(metaDir, "config.xtn")
+	_, err = os.Stat(configPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		configFile, err := os.Create(configPath)
+		if err != nil {
+			fmt.Printf("Failed to create file %v: %v\n", configPath, err)
+			os.Exit(1)
+		}
+		defer configFile.Close()
+
+		_, err = fmt.Fprintf(configFile, `
+# The name of the aws profile to be used for region selection and credentials. Refer to the AWS documentation on configuring a profile.
+aws_profile: 
+
 # Any unique name to distinguish this particular folder from any other folders that will also be synced against the same bucket.
 source_name: 
-	`)
-	if err != nil {
-		log.Fatalf("Failed to write to the file %v: %v", configPath, err)
+`)
+		if err != nil {
+			fmt.Printf("Failed to write to the file %v: %v\n", configPath, err)
+			os.Exit(1)
+		}
 	}
-	fmt.Printf("Fill in the config file created at %v", configPath)
+
+	fmt.Printf("Fill in the config files created at %v and %v\n", configPath, syncPath)
 }
 
 type syncer struct {
+	rootDir       string
 	dir           string
-	dirMode       fs.FileMode
+	relDir        string
 	metaDir       string
+	dirMode       fs.FileMode
+	patterns      []pathern.PathPattern
 	s3            *s3.Client
 	bucketName    string
 	keyPrefix     string
+	metaKeyPrefix string
 	sourceName    string
 	remoteStatus  map[string]any
 	foundStatus   bool
@@ -206,32 +289,66 @@ type RemoteFileRecord struct {
 }
 
 func (s *syncer) loadConfig() {
-	configPath := filepath.Join(s.metaDir, "config.xtn")
+	configPath := filepath.Join(s.rootDir, ".s3sync", "config.xtn")
+	syncPath := filepath.Join(s.rootDir, "s3sync.xtn")
 
 	configBytes, err := os.ReadFile(configPath)
 	if err != nil {
 		log.Fatal(err)
 		return
 	}
-	var cc map[string]any
-	xtn.UnmarshalToMap(configBytes, &cc)
 
-	awsProfile := readConfigString(cc, "aws_profile", "key aws_profile must exist in config.xtn. The value can be left blank to use the default aws profile")
+	syncBytes, err := os.ReadFile(syncPath)
+	if err != nil {
+		log.Fatal(err)
+		return
+	}
 
-	s.bucketName = readConfigString(cc, "bucket_name", "key bucket_name must exist in config.xtn")
+	var localConfig map[string]any
+	xtn.UnmarshalToMap(configBytes, &localConfig)
+
+	var syncConfig map[string]any
+	xtn.UnmarshalToMap(syncBytes, &syncConfig)
+
+	awsProfile := readConfigString(localConfig, "aws_profile", "key aws_profile must exist in config.xtn. The value can be left blank to use the default aws profile")
+
+	s.bucketName = readConfigString(syncConfig, "bucket_name", "key bucket_name must exist in s3sync.xtn")
 	if s.bucketName == "" {
-		log.Fatal("the value of key bucket_name in config.xtn must be the name of a s3 bucket. It cannot be blank")
+		log.Fatal("the value of key bucket_name in s3sync.xtn must be the name of a s3 bucket. It cannot be blank")
 	}
 
-	keyPrefix := readConfigString(cc, "key_prefix", "key key_prefix must exist in config.xtn. The value can be left blank to sync the directory against the entire bucket")
-	if len(keyPrefix) > 0 && !strings.HasSuffix(keyPrefix, "/") {
-		keyPrefix = keyPrefix + "/"
+	keyPrefix := filepath.FromSlash(readConfigString(syncConfig, "key_prefix", "key key_prefix must exist in s3sync.xtn. The value can be left blank to sync the directory against the entire bucket"))
+	if s.relDir != "." {
+		s.keyPrefix = filepath.ToSlash(filepath.Join(keyPrefix, s.relDir))
 	}
-	s.keyPrefix = keyPrefix
+	s.metaKeyPrefix = filepath.ToSlash(filepath.Join(keyPrefix, ".s3sync", s.relDir))
+	if len(s.keyPrefix) > 0 && !strings.HasSuffix(s.keyPrefix, "/") {
+		s.keyPrefix = s.keyPrefix + "/"
+	}
+	if !strings.HasSuffix(s.metaKeyPrefix, "/") {
+		s.metaKeyPrefix = s.metaKeyPrefix + "/"
+	}
 
-	s.sourceName = readConfigString(cc, "source_name", "key source_name must exist in config.xtn")
+	s.sourceName = readConfigString(localConfig, "source_name", "key source_name must exist in config.xtn")
 	if s.sourceName == "" {
 		log.Fatal("the value of key source_name in config.xtn must be a unique name for a folder. It cannot be blank")
+	}
+
+	dirConfig := readConfigDir(syncConfig, s.relDir)
+	patterns, ok := dirConfig["<patterns>"]
+	if !ok {
+		log.Fatalf("there are no patterns in s3sync.xtn for the specified directory")
+	}
+	switch patterns := patterns.(type) {
+	case []any:
+		for _, p := range patterns {
+			switch p := p.(type) {
+			case string:
+				s.patterns = append(s.patterns, pathern.New(p))
+			}
+		}
+	default:
+		log.Fatalf("patterns must be an array in s3sync.xtn")
 	}
 
 	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithSharedConfigProfile(awsProfile))
@@ -244,7 +361,7 @@ func (s *syncer) loadConfig() {
 func (s *syncer) findStatus() {
 	response, err := s.s3.GetObject(context.TODO(), &s3.GetObjectInput{
 		Bucket: aws.String(s.bucketName),
-		Key:    aws.String(s.keyPrefix + ".s3sync/status.json"),
+		Key:    aws.String(s.metaKeyPrefix + "status.json"),
 	})
 	if err != nil {
 		var re *awshttp.ResponseError
@@ -286,6 +403,18 @@ func (s *syncer) findIndex() {
 	s.foundIndex = true
 }
 
+func (s *syncer) shouldSync(key string) bool {
+	accept := false
+	for _, p := range s.patterns {
+		_, ok := p.Match(key)
+		if ok {
+			accept = true
+		}
+		// if pattern is negated and !ok, set accept to false
+	}
+	return accept
+}
+
 func (s *syncer) scanDirectory(dir string, prefix string) {
 	file, err := os.Open(dir)
 	if err != nil {
@@ -311,6 +440,9 @@ func (s *syncer) scanDirectory(dir string, prefix string) {
 			ext := filepath.Ext(key)
 			extLessKey, _ := strings.CutSuffix(key, ext)
 			if strings.HasSuffix(extLessKey, ".conflict.remote") || strings.HasSuffix(extLessKey, ".conflict.delete") {
+				continue
+			}
+			if !s.shouldSync(key) {
 				continue
 			}
 			record, ok := s.index.Files[key]
@@ -356,6 +488,7 @@ func (s *syncer) uploadAndDeleteFilesOnRemote() {
 		}
 		if record.CurrentTime != 0 {
 			path := filepath.Join(s.dir, filepath.FromSlash(key))
+			ext := filepath.Ext(path)
 			file, err := os.Open(path)
 			if err != nil {
 				s.errorCount++
@@ -365,9 +498,10 @@ func (s *syncer) uploadAndDeleteFilesOnRemote() {
 			}
 			fullKey := s.keyPrefix + key
 			response, err := s.s3.PutObject(context.TODO(), &s3.PutObjectInput{
-				Bucket: aws.String(s.bucketName),
-				Key:    aws.String(fullKey),
-				Body:   file,
+				Bucket:      aws.String(s.bucketName),
+				Key:         aws.String(fullKey),
+				Body:        file,
+				ContentType: aws.String(mime.TypeByExtension(ext)),
 			})
 			if err != nil {
 				s.errorCount++
@@ -517,7 +651,7 @@ func (s *syncer) readChangesFile(v uint64) *ChangeLog {
 	if errors.Is(err, fs.ErrNotExist) {
 		response, err := s.s3.GetObject(context.TODO(), &s3.GetObjectInput{
 			Bucket: aws.String(s.bucketName),
-			Key:    aws.String(s.keyPrefix + ".s3sync/" + changesName),
+			Key:    aws.String(s.metaKeyPrefix + changesName),
 		})
 		if err != nil {
 			log.Fatalf("Error downloading file from s3 bucket: %v", err)
@@ -655,7 +789,7 @@ func (s *syncer) uploadChangesFile(newVersion uint64) {
 
 	_, err = s.s3.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket: aws.String(s.bucketName),
-		Key:    aws.String(s.keyPrefix + ".s3sync/" + changesName),
+		Key:    aws.String(s.metaKeyPrefix + changesName),
 		Body:   changesFile,
 	})
 	if err != nil {
@@ -673,7 +807,7 @@ func (s *syncer) uploadStatusFile(newVersion uint64) {
 
 	_, err = s.s3.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket: aws.String(s.bucketName),
-		Key:    aws.String(s.keyPrefix + ".s3sync/status.json"),
+		Key:    aws.String(s.metaKeyPrefix + "status.json"),
 		Body:   bytes.NewReader(statusJson),
 	})
 	if err != nil {
@@ -703,7 +837,26 @@ func readConfigString(config map[string]any, key string, missingMsg string) stri
 	}
 	s, ok := v.(string)
 	if !ok {
-		log.Fatalf("key %s in config.xtn must be text\n", key)
+		log.Fatalf("key %s in s3sync.xtn must be text\n", key)
 	}
 	return s
+}
+
+func readConfigDir(config map[string]any, relPath string) map[string]any {
+	dir, last := filepath.Split(relPath)
+	dir = filepath.Clean(dir)
+	if last != "." {
+		config = readConfigDir(config, dir)
+	}
+	res, ok := config[last]
+	if !ok {
+		log.Fatalf("s3sync.xtn does not have any configuration key for the %v directory.", last)
+	}
+	switch res := res.(type) {
+	case map[string]any:
+		return res
+	default:
+		log.Fatalf("s3sync.xtn has invalid configuration for the %v directory. The value must be an object", last)
+	}
+	return nil
 }
